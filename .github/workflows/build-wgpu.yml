@@ -4,9 +4,13 @@ on:
   workflow_dispatch:
 
 env:
-  WGPU_REF: v0.17.0.2
+  WGPU_REF: v0.19.1.1
   ANDROID_MIN_SDK: "21"
-
+  
+permissions:
+  pull-requests: write
+  contents: write
+  
 jobs:
   build-wgpu:
     name: ${{ matrix.name }}
