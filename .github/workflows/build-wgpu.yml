@@ -1,0 +1,150 @@
+name: Build wgpu-native
+
+on:
+  workflow_dispatch:
+
+env:
+  WGPU_REF: v0.17.0.2
+  ANDROID_MIN_SDK: "21"
+
+jobs:
+  build-wgpu:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    env:
+      CARGO_BUILD_TARGET: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: build - android/amd64
+            os: ubuntu-22.04
+            target: x86_64-linux-android
+            goos: android
+            goarch: amd64
+            setup_env: |
+              set -x
+              export CC=$ANDROID_NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android$ANDROID_MIN_SDK-clang
+
+              echo "CC=$CC" >> $GITHUB_ENV
+              echo "CXX=$CC++" >> $GITHUB_ENV
+              echo "CLANG_PATH=$CC" >> $GITHUB_ENV
+              echo "CARGO_TARGET_X86_64_LINUX_ANDROID_LINKER=$CC" >> $GITHUB_ENV
+
+          - name: build - android/arm64
+            os: ubuntu-22.04
+            target: aarch64-linux-android
+            goos: android
+            goarch: arm64
+            setup_env: |
+              set -x
+              export CC=$ANDROID_NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android$ANDROID_MIN_SDK-clang
+
+              echo "CC=$CC" >> $GITHUB_ENV
+              echo "CXX=$CC++" >> $GITHUB_ENV
+              echo "CLANG_PATH=$CC" >> $GITHUB_ENV
+              echo "CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$CC" >> $GITHUB_ENV
+
+    steps:
+      # Checkout
+      - uses: actions/checkout@v2
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+
+      - if: ${{ matrix.goos == 'android' }}
+        name: Setup Android NDK
+        shell: bash
+        run: |
+          set -ex
+          mkdir -p /tmp/go-webgpu-ndk/
+          cd /tmp/go-webgpu-ndk/
+
+          # ndkVersion "25.2.9519653"
+          curl -LO https://dl.google.com/android/repository/android-ndk-r25c-linux.zip
+
+          unzip android-ndk-r25c-linux.zip
+          rm android-ndk-r25c-linux.zip
+          export ANDROID_NDK_PATH=$PWD/android-ndk-r25c
+
+          echo "ANDROID_NDK_PATH=$ANDROID_NDK_PATH" >> $GITHUB_ENV
+          echo "LIBCLANG_PATH=$ANDROID_NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/lib64/libclang.so.13" >> $GITHUB_ENV
+          echo "LLVM_CONFIG_PATH=$ANDROID_NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-config" >> $GITHUB_ENV
+          echo "BINDGEN_EXTRA_CLANG_ARGS='-isysroot $ANDROID_NDK_PATH/toolchains/llvm/prebuilt/linux-x86_64/sysroot'" >> $GITHUB_ENV
+
+      - name: Setup Environment
+        shell: bash
+        run: ${{ matrix.setup_env }}
+
+      - name: Build
+        shell: bash
+        run: |
+          set -ex
+
+          git clone --recursive https://github.com/gfx-rs/wgpu-native.git tmp
+          cd tmp
+          git checkout $WGPU_REF
+
+          # workaround missing libgcc in ndk r23+
+          if [ ${{ matrix.goos }} == "android" ]; then
+            mkdir -p tmp-lib
+            echo "INPUT(-lunwind)" | tee tmp-lib/libgcc.so
+            export RUSTFLAGS="-L $PWD/tmp-lib"
+          fi
+
+          cargo build --release
+          ls -al target/${{ matrix.target }}/release/
+
+          mv target/${{ matrix.target }}/release/libwgpu_native.so target/${{ matrix.target }}/release/${{ matrix.goos }}_${{ matrix.goarch }}_libwgpu_native.so
+          
+
+      - uses: actions/upload-artifact@v3
+        with:
+          name: wgpu-artifacts
+          path: |
+            ${{ github.workspace }}/tmp/target/${{ matrix.target }}/release/${{ matrix.goos }}_${{ matrix.goarch }}_libwgpu_native.so
+
+  send-pr:
+    if: ${{ github.ref == 'refs/heads/main' }}
+    needs: build-wgpu
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - uses: actions/download-artifact@v3
+        with:
+          name: wgpu-artifacts
+          path: ${{ github.workspace }}/tmp
+
+      - name: Copy artifacts
+        shell: bash
+        run: |
+          set -ex
+
+          declare -a arr=(
+              "android_amd64"
+              "android_arm64")
+
+          for i in "${arr[@]}"
+          do
+              # split string
+              IFS='_' read -ra tuple <<< "$i"
+              GOOS="${tuple[0]}"
+              GOARCH="${tuple[1]}"
+
+              mkdir -p $GITHUB_WORKSPACE/wgpu/lib/$GOOS/$GOARCH
+              rm -f $GITHUB_WORKSPACE/wgpu/lib/$GOOS/$GOARCH/libwgpu_native.so
+              cp $GITHUB_WORKSPACE/tmp/"$GOOS"_"$GOARCH"_libwgpu_native.so $GITHUB_WORKSPACE/wgpu/lib/$GOOS/$GOARCH/libwgpu_native.so  
+          done
+
+          rm -rf $GITHUB_WORKSPACE/tmp
+          tree $GITHUB_WORKSPACE/wgpu
+
+      - name: Create Pull Request
+        uses: peter-evans/create-pull-request@v3
+        with:
+          commit-message: update `wgpu-native` library
+          branch-suffix: random
+          title: update `wgpu-native` library
+          body: auto-generated PR to update `wgpu-native` library
